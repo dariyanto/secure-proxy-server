@@ -74,9 +74,12 @@ func startAPIServer() {
 	router.HandleFunc("/api/validate", validateTokenHandler).Methods("GET")
 	router.HandleFunc("/api/proxy/register", registerProxyHandler).Methods("POST")
 
+	// Add logging middleware
+	loggedRouter := loggingMiddleware(router)
+
 	// Serve API
 	fmt.Printf("API Server running on http://localhost%s\n", apiPort)
-	log.Fatal(http.ListenAndServe(apiPort, router))
+	log.Fatal(http.ListenAndServe(apiPort, loggedRouter))
 }
 
 func startProxyServer() {
@@ -85,8 +88,40 @@ func startProxyServer() {
 	// Proxy handler with authentication middleware
 	router.PathPrefix("/").HandlerFunc(proxyHandler)
 
+	// Add logging middleware
+	loggedRouter := loggingMiddleware(router)
+
 	fmt.Printf("Proxy Server running on http://localhost%s\n", proxyPort)
-	log.Fatal(http.ListenAndServe(proxyPort, router))
+	log.Fatal(http.ListenAndServe(proxyPort, loggedRouter))
+}
+
+// loggingMiddleware logs every request and response status/size
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		log.Printf("Incoming %s %s from %s", r.Method, r.RequestURI, r.RemoteAddr)
+		lrw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		next.ServeHTTP(lrw, r)
+		duration := time.Since(start)
+		log.Printf("Responded %d (%d bytes) in %v for %s %s", lrw.statusCode, lrw.size, duration, r.Method, r.RequestURI)
+	})
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+	size       int
+}
+
+func (lrw *loggingResponseWriter) WriteHeader(code int) {
+	lrw.statusCode = code
+	lrw.ResponseWriter.WriteHeader(code)
+}
+
+func (lrw *loggingResponseWriter) Write(b []byte) (int, error) {
+	n, err := lrw.ResponseWriter.Write(b)
+	lrw.size += n
+	return n, err
 }
 
 // Authentication Middleware
@@ -174,8 +209,15 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		req.URL.RawQuery = q.Encode()
 	}
 
-	// Serve via proxy
-	proxy.ServeHTTP(w, r)
+	// Log proxying
+	log.Printf("Proxying request for token %s to %s", token, targetURL)
+
+	// Wrap the ResponseWriter to log response status and size
+	lrw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+	start := time.Now()
+	proxy.ServeHTTP(lrw, r)
+	duration := time.Since(start)
+	log.Printf("Proxied response %d (%d bytes) in %v for %s %s", lrw.statusCode, lrw.size, duration, r.Method, r.RequestURI)
 }
 
 // API Handlers
