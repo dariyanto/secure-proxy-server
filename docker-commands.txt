@@ -1,0 +1,8 @@
+# Build the Docker image
+# docker build -t secure-proxy-server .
+
+
+# Run the Docker container with both ports exposed
+# docker run -p 8080:8080 -p 8081:8081 secure-proxy-server
+
+# (Change 8080 to your app's port if different)
