@@ -1,0 +1,28 @@
+version: '3.8'
+services:
+  api-gateway:
+    build:
+      context: ./api-gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8081"
+    networks:
+      - proxy-net
+    restart: unless-stopped
+
+  proxy-server:
+    build:
+      context: ./proxy-server
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    networks:
+      - proxy-net
+    restart: unless-stopped
+
+# environment:
+  # Add shared environment variables here if needed
+
+networks:
+  proxy-net:
+    driver: bridge

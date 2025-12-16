@@ -1,5 +1,4 @@
-// go.mod - Go Module File
-module proxy-server
+module api-gateway
 
 go 1.21
 
