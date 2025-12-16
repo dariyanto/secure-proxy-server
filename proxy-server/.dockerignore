@@ -1,0 +1,10 @@
+# .dockerignore
+# Ignore the binary and other files not needed in the image
+*.log
+*.tmp
+*.out
+vendor/
+.git/
+.gitignore
+Dockerfile
+README.md

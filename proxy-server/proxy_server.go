@@ -2,71 +2,143 @@
 package main
 
 import (
+	"context"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
-	"time"
+
+	"github.com/dgrijalva/jwt-go"
 )
 
 var (
-	proxyPort  = ":8080"
-	userTokens = make(map[string]string) // This should be shared or replaced with a persistent store in production
+	proxyPort = ":8080"
+	publicKey *rsa.PublicKey
 )
 
+type TargetRequest struct {
+	Target   string `json:"target"`
+	DeviceId string `json:"device_id,omitempty"`
+}
+
 func main() {
+	var err error
+	publicKey, err = loadPublicKey("public.pem")
+	if err != nil {
+		log.Fatalf("Failed to load public key: %v", err)
+	}
 	startProxyServer()
 }
 
 func startProxyServer() {
-	http.HandleFunc("/", proxyHandler)
-	fmt.Printf("Proxy Server running on http://0.0.0.0%s\n", proxyPort)
+	http.HandleFunc("/", customProxyHandler)
+	log.Printf("Proxy Server running on http://0.0.0.0%s", proxyPort)
 	log.Fatal(http.ListenAndServe(proxyPort, nil))
 }
 
-func proxyHandler(w http.ResponseWriter, r *http.Request) {
-	token := r.Header.Get("Authorization")
-	if token == "" {
-		token = r.URL.Query().Get("token")
+func customProxyHandler(w http.ResponseWriter, r *http.Request) {
+	tokenStr := r.Header.Get("Authorization")
+	if tokenStr == "" {
+		tokenStr = r.URL.Query().Get("token")
 	}
-	if token == "" {
+	if tokenStr == "" {
 		http.Error(w, "Token required", http.StatusBadRequest)
 		return
 	}
-	token = strings.TrimPrefix(token, "Bearer ")
-	targetURL, exists := userTokens[token]
-	if !exists {
+	tokenStr = strings.TrimPrefix(tokenStr, "Bearer ")
+	claims := &jwt.StandardClaims{}
+	token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (any, error) {
+		return publicKey, nil
+	})
+	if err != nil || !token.Valid {
 		http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
 		return
 	}
-	target, err := url.Parse(targetURL)
+
+	var reqBody TargetRequest
+	if r.Method == http.MethodPost {
+		defer r.Body.Close()
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusBadRequest)
+			return
+		}
+		if err := json.Unmarshal(body, &reqBody); err != nil {
+			http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+			return
+		}
+	} else {
+		http.Error(w, "Only POST method is supported", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if reqBody.Target == "" {
+		http.Error(w, "Target required in JSON body", http.StatusBadRequest)
+		return
+	}
+
+	target, err := url.Parse(reqBody.Target)
 	if err != nil {
 		http.Error(w, "Invalid target URL", http.StatusBadRequest)
 		return
 	}
+
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		if strings.Contains(err.Error(), "connection reset by peer") || strings.Contains(err.Error(), "ECONNRESET") {
-			log.Printf("ECONNRESET: %v", err)
-			http.Error(w, "Upstream connection reset", http.StatusBadGateway)
-			return
-		}
-		log.Printf("Proxy error: %v", err)
-		http.Error(w, "Proxy error", http.StatusBadGateway)
-	}
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
-		req.Host = target.Host
+		// Remove token from query and headers
 		q := req.URL.Query()
 		q.Del("token")
 		req.URL.RawQuery = q.Encode()
+		req.Header.Del("Authorization")
+		// Optionally, set Host header to target host
+		req.Host = target.Host
+
+		// Set the body and headers for the proxied request
+		req.Body = io.NopCloser(strings.NewReader(string(r.Context().Value("body").([]byte))))
+		req.ContentLength = int64(len(r.Context().Value("body").([]byte)))
+		req.Header.Set("Content-Type", r.Header.Get("Content-Type"))
 	}
-	log.Printf("Proxying request for token %s to %s", token, targetURL)
-	start := time.Now()
+
+	// Store the original body in the request context for use in Director
+	ctx := r.Context()
+	bodyBytes, _ := io.ReadAll(r.Body)
+	ctx = contextWithBody(ctx, bodyBytes)
+	r = r.WithContext(ctx)
+	r.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
+
 	proxy.ServeHTTP(w, r)
-	duration := time.Since(start)
-	log.Printf("Proxied response in %v for %s %s", duration, r.Method, r.RequestURI)
+}
+
+func contextWithBody(ctx context.Context, bodyBytes []byte) context.Context {
+	return context.WithValue(ctx, "body", bodyBytes)
+}
+
+func loadPublicKey(path string) (*rsa.PublicKey, error) {
+	keyData, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(keyData)
+	if block == nil || block.Type != "PUBLIC KEY" {
+		return nil, fmt.Errorf("failed to decode PEM block containing public key")
+	}
+	key, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	pub, ok := key.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("not RSA public key")
+	}
+	return pub, nil
 }

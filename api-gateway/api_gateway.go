@@ -2,52 +2,30 @@
 package main
 
 import (
-	"encoding/json"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gorilla/mux"
-	"golang.org/x/crypto/bcrypt"
 )
 
 var (
-	jwtSecret  = []byte("your-secret-key-change-this") // Change this in production!
+	privateKey *rsa.PrivateKey
 	apiPort    = ":8081"
-	userTokens = make(map[string]string) // In production, use a database or shared store
 )
 
-type User struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-
-type Claims struct {
-	Username string `json:"username"`
-	jwt.StandardClaims
-}
-
-type LoginRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-
-type LoginResponse struct {
-	Token   string `json:"token"`
-	Message string `json:"message"`
-}
-
-type ProxyConfig struct {
-	TargetURL string `json:"target_url"`
-	Token     string `json:"token"`
-}
-
-// In-memory user store for demonstration (replace with persistent storage in production)
-var users = make(map[string]string) // username -> hashed password
-
 func main() {
+	var err error
+	privateKey, err = loadPrivateKey("private.pem")
+	if err != nil {
+		log.Fatalf("Failed to load private key: %v", err)
+	}
 	startAPIServer()
 }
 
@@ -55,127 +33,75 @@ func startAPIServer() {
 	router := mux.NewRouter()
 
 	// Authentication endpoints
-	router.HandleFunc("/api/register", registerHandler).Methods("POST")
-	router.HandleFunc("/api/login", loginHandler).Methods("POST")
-	router.HandleFunc("/api/validate", validateTokenHandler).Methods("GET")
-	router.HandleFunc("/api/proxy/register", registerProxyHandler).Methods("POST")
-
+	router.HandleFunc("/api/generate-token", generateTokenHandler).Methods("POST")
 	loggedRouter := loggingMiddleware(router)
-
 	fmt.Printf("API Server running on http://0.0.0.0%s\n", apiPort)
 	log.Fatal(http.ListenAndServe(apiPort, loggedRouter))
 }
 
-// loggingMiddleware logs every request and response status/size
+func generateTokenHandler(w http.ResponseWriter, r *http.Request) {
+	claims := &jwt.StandardClaims{
+		ExpiresAt: time.Now().Add(15 * time.Minute).Unix(),
+		IssuedAt:  time.Now().Unix(),
+		Issuer:    "api-gateway",
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	signedToken, err := token.SignedString(privateKey)
+	if err != nil {
+		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf(`{"token":"%s"}`, signedToken)))
+}
+
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		log.Printf("Incoming %s %s from %s", r.Method, r.RequestURI, r.RemoteAddr)
-		lrw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-		next.ServeHTTP(lrw, r)
-		duration := time.Since(start)
-		log.Printf("Responded %d (%d bytes) in %v for %s %s", lrw.statusCode, lrw.size, duration, r.Method, r.RequestURI)
+		next.ServeHTTP(w, r)
+		log.Printf("%s %s %s", r.Method, r.RequestURI, time.Since(start))
 	})
 }
 
-type loggingResponseWriter struct {
-	http.ResponseWriter
-	statusCode int
-	size       int
-}
-
-func (lrw *loggingResponseWriter) WriteHeader(code int) {
-	lrw.statusCode = code
-	lrw.ResponseWriter.WriteHeader(code)
-}
-
-func (lrw *loggingResponseWriter) Write(b []byte) (int, error) {
-	n, err := lrw.ResponseWriter.Write(b)
-	lrw.size += n
-	return n, err
-}
-
-func registerHandler(w http.ResponseWriter, r *http.Request) {
-	var req User
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request", http.StatusBadRequest)
-		return
-	}
-	if _, exists := users[req.Username]; exists {
-		http.Error(w, "User already exists", http.StatusConflict)
-		return
-	}
-	hashed, err := hashPassword(req.Password)
+// loadPrivateKey loads an RSA private key from a PEM file
+func loadPrivateKey(path string) (*rsa.PrivateKey, error) {
+	keyData, err := ioutil.ReadFile(path)
 	if err != nil {
-		http.Error(w, "Error processing password", http.StatusInternalServerError)
-		return
+		return nil, err
 	}
-	users[req.Username] = hashed
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{"message": "User registered"})
-}
-
-func loginHandler(w http.ResponseWriter, r *http.Request) {
-	var req LoginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request", http.StatusBadRequest)
-		return
+	block, _ := pem.Decode(keyData)
+	if block == nil || block.Type != "PRIVATE KEY" {
+		return nil, fmt.Errorf("failed to decode PEM block containing private key")
 	}
-	hashed, exists := users[req.Username]
-	if !exists || !checkPasswordHash(req.Password, hashed) {
-		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
-		return
-	}
-	expirationTime := time.Now().Add(24 * time.Hour)
-	claims := &Claims{
-		Username: req.Username,
-		StandardClaims: jwt.StandardClaims{
-			ExpiresAt: expirationTime.Unix(),
-		},
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokenString, err := token.SignedString(jwtSecret)
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 	if err != nil {
-		http.Error(w, "Could not create token", http.StatusInternalServerError)
-		return
+		return nil, err
 	}
-	userTokens[req.Username] = tokenString
-	json.NewEncoder(w).Encode(LoginResponse{Token: tokenString, Message: "Login successful"})
+	priv, ok := key.(*rsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("not RSA private key")
+	}
+	return priv, nil
 }
 
-func validateTokenHandler(w http.ResponseWriter, r *http.Request) {
-	tokenStr := r.Header.Get("Authorization")
-	if tokenStr == "" {
-		http.Error(w, "Missing token", http.StatusUnauthorized)
-		return
+// loadPublicKey loads an RSA public key from a PEM file
+func loadPublicKey(path string) (*rsa.PublicKey, error) {
+	keyData, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
 	}
-	claims := &Claims{}
-	token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
-		return jwtSecret, nil
-	})
-	if err != nil || !token.Valid {
-		http.Error(w, "Invalid token", http.StatusUnauthorized)
-		return
+	block, _ := pem.Decode(keyData)
+	if block == nil || block.Type != "PUBLIC KEY" {
+		return nil, fmt.Errorf("failed to decode PEM block containing public key")
 	}
-	json.NewEncoder(w).Encode(map[string]string{"message": "Token valid", "username": claims.Username})
-}
-
-func registerProxyHandler(w http.ResponseWriter, r *http.Request) {
-	var req ProxyConfig
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request", http.StatusBadRequest)
-		return
+	key, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, err
 	}
-	// For demonstration, just echo back the config
-	json.NewEncoder(w).Encode(map[string]string{"message": "Proxy registered", "target_url": req.TargetURL})
-}
-
-func hashPassword(password string) (string, error) {
-	bytes, err := bcrypt.GenerateFromPassword([]byte(password), 14)
-	return string(bytes), err
-}
-
-func checkPasswordHash(password, hash string) bool {
-	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
-	return err == nil
+	pub, ok := key.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("not RSA public key")
+	}
+	return pub, nil
 }
