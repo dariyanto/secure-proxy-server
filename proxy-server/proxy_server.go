@@ -2,7 +2,6 @@
 package main
 
 import (
-	"context"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/json"
@@ -11,12 +10,12 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
 
 	"github.com/dgrijalva/jwt-go"
+	"github.com/elazarl/goproxy"
 )
 
 var (
@@ -91,36 +90,27 @@ func customProxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		// Remove token from query and headers
-		q := req.URL.Query()
-		q.Del("token")
-		req.URL.RawQuery = q.Encode()
-		req.Header.Del("Authorization")
-		// Optionally, set Host header to target host
-		req.Host = target.Host
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.Verbose = false
 
-		// Set the body and headers for the proxied request
-		req.Body = io.NopCloser(strings.NewReader(string(r.Context().Value("body").([]byte))))
-		req.ContentLength = int64(len(r.Context().Value("body").([]byte)))
-		req.Header.Set("Content-Type", r.Header.Get("Content-Type"))
-	}
+	// Remove token from query and headers, and set Host header
+	proxy.OnRequest().DoFunc(
+		func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+			// Remove token from query and headers
+			q := req.URL.Query()
+			q.Del("token")
+			req.URL.RawQuery = q.Encode()
+			req.Header.Del("Authorization")
+			// Optionally, set Host header to target host
+			req.Host = target.Host
+			req.URL.Scheme = target.Scheme
+			req.URL.Host = target.Host
+			return req, nil
+		},
+	)
 
-	// Store the original body in the request context for use in Director
-	ctx := r.Context()
-	bodyBytes, _ := io.ReadAll(r.Body)
-	ctx = contextWithBody(ctx, bodyBytes)
-	r = r.WithContext(ctx)
-	r.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
-
+	// Forward the request to the target
 	proxy.ServeHTTP(w, r)
-}
-
-func contextWithBody(ctx context.Context, bodyBytes []byte) context.Context {
-	return context.WithValue(ctx, "body", bodyBytes)
 }
 
 func loadPublicKey(path string) (*rsa.PublicKey, error) {
